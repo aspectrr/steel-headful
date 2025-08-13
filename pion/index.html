@@ -1,0 +1,184 @@
+<!doctype html>
+<html>
+    <head>
+        <title>WebRTC Video Stream</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background-color: #f0f0f0;
+            }
+            h1 {
+                color: #333;
+            }
+            #video {
+                max-width: 100%;
+                border: 1px solid #ccc;
+                background-color: #000;
+            }
+            #status {
+                margin-top: 10px;
+                padding: 10px;
+                background-color: #eee;
+            }
+            #log {
+                margin-top: 10px;
+                padding: 10px;
+                height: 150px;
+                overflow-y: auto;
+                background-color: #f8f8f8;
+                border: 1px solid #ddd;
+                font-family: monospace;
+                font-size: 12px;
+            }
+            .controls {
+                margin-top: 10px;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>Live Stream</h1>
+        <video id="video" autoplay playsinline controls></video>
+        <div id="status">Initializing...</div>
+        <div class="controls">
+            <button id="reconnect">Reconnect</button>
+        </div>
+        <div id="log"></div>
+
+        <script>
+            const video = document.getElementById("video");
+            const status = document.getElementById("status");
+            const log = document.getElementById("log");
+            const reconnectButton = document.getElementById("reconnect");
+
+            let pc = null;
+            let ws = null;
+
+            // Add log function for debugging
+            function addLog(message) {
+                const line = document.createElement('div');
+                line.textContent = `${new Date().toLocaleTimeString()}: ${message}`;
+                log.appendChild(line);
+                log.scrollTop = log.scrollHeight;
+                console.log(message);
+            }
+
+            // Close previous connections
+            function closeConnections() {
+                if (pc) {
+                    pc.close();
+                    pc = null;
+                }
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.close();
+                    ws = null;
+                }
+            }
+
+            // Initialize WebRTC connection
+            async function connect() {
+                // Close any existing connections
+                closeConnections();
+
+                status.textContent = "Initializing connection...";
+                addLog("Initializing new connection");
+
+                // Create new RTCPeerConnection
+                pc = new RTCPeerConnection({
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' },
+                        { urls: 'stun:stun2.l.google.com:19302' }
+                    ],
+                    iceCandidatePoolSize: 10
+                });
+
+                // Handle incoming tracks
+                pc.ontrack = (event) => {
+                    addLog("Track received");
+                    status.textContent = "Stream connected!";
+                    video.srcObject = event.streams[0];
+                };
+
+                // Log ICE connection state changes
+                pc.oniceconnectionstatechange = () => {
+                    const state = pc.iceConnectionState;
+                    status.textContent = "ICE State: " + state;
+                    addLog(`ICE state changed to: ${state}`);
+
+                    if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+                        addLog("Connection lost or failed");
+                        video.srcObject = null;
+                    }
+                };
+
+                // Connect to WebSocket server
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                ws = new WebSocket(`${protocol}//${window.location.host}/signal`);
+
+                ws.onopen = async () => {
+                    addLog("WebSocket connected");
+                    status.textContent = "Signaling connected, creating offer...";
+
+                    try {
+                        // Add video transceiver
+                        pc.addTransceiver('video', {direction: 'recvonly'});
+
+                        // Create offer
+                        const offer = await pc.createOffer({
+                            offerToReceiveVideo: true,
+                            offerToReceiveAudio: false
+                        });
+
+                        addLog(`Created offer`);
+
+                        // Set local description
+                        await pc.setLocalDescription(offer);
+                        addLog("Local description set");
+
+                        // Send offer to server
+                        ws.send("offer");
+                        ws.send(JSON.stringify(pc.localDescription));
+
+                        status.textContent = "Offer sent, waiting for answer...";
+                    } catch (err) {
+                        status.textContent = "Error: " + err.message;
+                        addLog(`Error creating offer: ${err.message}`);
+                    }
+                };
+
+                ws.onmessage = async (event) => {
+                    try {
+                        const answer = JSON.parse(event.data);
+                        addLog(`Received answer`);
+
+                        await pc.setRemoteDescription(answer);
+                        addLog("Remote description set");
+
+                        status.textContent = "Connected, waiting for video...";
+                    } catch (err) {
+                        status.textContent = "Error: " + err.message;
+                        addLog(`Error setting remote description: ${err.message}`);
+                    }
+                };
+
+                ws.onerror = (error) => {
+                    status.textContent = "WebSocket error";
+                    addLog("WebSocket error");
+                };
+
+                ws.onclose = () => {
+                    status.textContent = "WebSocket disconnected";
+                    addLog("WebSocket connection closed");
+                };
+            }
+
+            // Add event listener for reconnect button
+            reconnectButton.addEventListener('click', connect);
+
+            // Connect on page load
+            connect();
+        </script>
+    </body>
+</html>
