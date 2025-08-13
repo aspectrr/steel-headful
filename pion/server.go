@@ -524,10 +524,14 @@ func main() {
             width: 100%;
             max-width: 800px;
             border: 2px solid #333;
-            cursor: crosshair;
+            cursor: none;
             display: block;
             margin: 0 auto 20px auto;
             background: #000;
+        }
+        #videoCanvas:focus {
+            outline: 2px solid #007bff;
+            outline-offset: 2px;
         }
         #hiddenVideo {
             display: none;
