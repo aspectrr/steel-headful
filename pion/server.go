@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"strconv"
 	"sync"
 	"time"
 
@@ -22,10 +24,30 @@ var (
 	videoTrackLock sync.RWMutex
 )
 
-// Message types for signaling
+// Message types for signaling and interactions
 type Message struct {
-	Type string      `json:"type"`
-	Data interface{} `json:"data"`
+	Type string `json:"type"`
+	Data any    `json:"data"`
+}
+
+// Mouse event data
+type MouseEvent struct {
+	X      int    `json:"x"`
+	Y      int    `json:"y"`
+	Button string `json:"button"` // "left", "right", "middle"
+	Action string `json:"action"` // "down", "up", "click", "move"
+}
+
+// Keyboard event data
+type KeyboardEvent struct {
+	Key    string `json:"key"`
+	Action string `json:"action"` // "down", "up", "type"
+}
+
+// Clipboard event data
+type ClipboardEvent struct {
+	Text   string `json:"text"`
+	Action string `json:"action"` // "copy", "paste"
 }
 
 func createPeerConnection() (*webrtc.PeerConnection, *webrtc.TrackLocalStaticRTP, error) {
@@ -49,7 +71,7 @@ func createPeerConnection() (*webrtc.PeerConnection, *webrtc.TrackLocalStaticRTP
 	settingEngine := webrtc.SettingEngine{}
 	settingEngine.SetEphemeralUDPPortRange(10000, 11000)
 
-	// FIXED: Use actual external IP instead of host.docker.internal
+	// Use actual external IP instead of host.docker.internal
 	if net.ParseIP(publicIP) != nil {
 		settingEngine.SetNAT1To1IPs([]string{publicIP}, webrtc.ICECandidateTypeHost)
 		log.Printf("Set NAT1To1IP to: %s", publicIP)
@@ -126,8 +148,121 @@ func createPeerConnection() (*webrtc.PeerConnection, *webrtc.TrackLocalStaticRTP
 	return peerConnection, videoTrack, nil
 }
 
+// Handle mouse events by sending them to xdotool
+func handleMouseEvent(event MouseEvent) error {
+	log.Printf("Mouse event: %+v", event)
+
+	display := os.Getenv("DISPLAY")
+	if display == "" {
+		display = ":10"
+	}
+
+	var cmd *exec.Cmd
+
+	switch event.Action {
+	case "move":
+		cmd = exec.Command("xdotool", "mousemove", strconv.Itoa(event.X), strconv.Itoa(event.Y))
+	case "click":
+		buttonNum := "1" // left click
+		if event.Button == "right" {
+			buttonNum = "3"
+		} else if event.Button == "middle" {
+			buttonNum = "2"
+		}
+		// Move first, then click
+		exec.Command("xdotool", "mousemove", strconv.Itoa(event.X), strconv.Itoa(event.Y)).Run()
+		cmd = exec.Command("xdotool", "click", buttonNum)
+	case "down":
+		buttonNum := "1"
+		if event.Button == "right" {
+			buttonNum = "3"
+		} else if event.Button == "middle" {
+			buttonNum = "2"
+		}
+		exec.Command("xdotool", "mousemove", strconv.Itoa(event.X), strconv.Itoa(event.Y)).Run()
+		cmd = exec.Command("xdotool", "mousedown", buttonNum)
+	case "up":
+		buttonNum := "1"
+		if event.Button == "right" {
+			buttonNum = "3"
+		} else if event.Button == "middle" {
+			buttonNum = "2"
+		}
+		cmd = exec.Command("xdotool", "mouseup", buttonNum)
+	}
+
+	if cmd != nil {
+		cmd.Env = append(os.Environ(), "DISPLAY="+display)
+		return cmd.Run()
+	}
+
+	return nil
+}
+
+// Handle keyboard events
+func handleKeyboardEvent(event KeyboardEvent) error {
+	log.Printf("Keyboard event: %+v", event)
+
+	display := os.Getenv("DISPLAY")
+	if display == "" {
+		display = ":10"
+	}
+
+	var cmd *exec.Cmd
+
+	switch event.Action {
+	case "type":
+		cmd = exec.Command("xdotool", "type", event.Key)
+	case "down":
+		cmd = exec.Command("xdotool", "keydown", event.Key)
+	case "up":
+		cmd = exec.Command("xdotool", "keyup", event.Key)
+	}
+
+	if cmd != nil {
+		cmd.Env = append(os.Environ(), "DISPLAY="+display)
+		return cmd.Run()
+	}
+
+	return nil
+}
+
+// Handle clipboard events
+func handleClipboardEvent(event ClipboardEvent) error {
+	log.Printf("Clipboard event: %+v", event)
+
+	display := os.Getenv("DISPLAY")
+	if display == "" {
+		display = ":10"
+	}
+
+	var cmd *exec.Cmd
+
+	switch event.Action {
+	case "paste":
+		// Set clipboard content then paste
+		cmd = exec.Command("sh", "-c", "echo '"+event.Text+"' | xclip -selection clipboard")
+		cmd.Env = append(os.Environ(), "DISPLAY="+display)
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+		// Now paste with Ctrl+V
+		cmd = exec.Command("xdotool", "key", "ctrl+v")
+	case "copy":
+		// Send Ctrl+C to copy
+		cmd = exec.Command("xdotool", "key", "ctrl+c")
+	}
+
+	if cmd != nil {
+		cmd.Env = append(os.Environ(), "DISPLAY="+display)
+		return cmd.Run()
+	}
+
+	return nil
+}
+
 func main() {
-	log.Println("Starting WebRTC server...")
+	log.Println("Starting WebRTC server with interaction support...")
 
 	// Start RTP listener for ffmpeg stream
 	go func() {
@@ -188,7 +323,7 @@ func main() {
 		}
 	}()
 
-	// FIXED: Improved WebSocket handler with proper ICE candidate exchange
+	// WebSocket handler for signaling and interactions
 	http.HandleFunc("/signal", func(w http.ResponseWriter, r *http.Request) {
 		log.Println("New WebSocket connection")
 		ws, err := upgrader.Upgrade(w, r, nil)
@@ -211,7 +346,7 @@ func main() {
 		videoTracks = append(videoTracks, videoTrack)
 		videoTrackLock.Unlock()
 
-		// FIXED: Handle ICE candidates
+		// Handle ICE candidates
 		peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 			if candidate == nil {
 				log.Println("ICE gathering complete")
@@ -252,9 +387,6 @@ func main() {
 					log.Printf("Failed to unmarshal offer: %v", err)
 					break
 				}
-
-				log.Printf("Received offer SDP: %s", offer.SDP)
-				log.Printf("Offer type: %s", offer.Type)
 
 				log.Println("Received offer, setting remote description")
 				if err := peerConnection.SetRemoteDescription(offer); err != nil {
@@ -308,6 +440,60 @@ func main() {
 					log.Printf("Failed to add ICE candidate: %v", err)
 				}
 
+			case "mouse":
+				// Handle mouse events
+				eventData, err := json.Marshal(msg.Data)
+				if err != nil {
+					log.Printf("Failed to marshal mouse data: %v", err)
+					continue
+				}
+
+				var mouseEvent MouseEvent
+				if err := json.Unmarshal(eventData, &mouseEvent); err != nil {
+					log.Printf("Failed to unmarshal mouse event: %v", err)
+					continue
+				}
+
+				if err := handleMouseEvent(mouseEvent); err != nil {
+					log.Printf("Failed to handle mouse event: %v", err)
+				}
+
+			case "keyboard":
+				// Handle keyboard events
+				eventData, err := json.Marshal(msg.Data)
+				if err != nil {
+					log.Printf("Failed to marshal keyboard data: %v", err)
+					continue
+				}
+
+				var keyboardEvent KeyboardEvent
+				if err := json.Unmarshal(eventData, &keyboardEvent); err != nil {
+					log.Printf("Failed to unmarshal keyboard event: %v", err)
+					continue
+				}
+
+				if err := handleKeyboardEvent(keyboardEvent); err != nil {
+					log.Printf("Failed to handle keyboard event: %v", err)
+				}
+
+			case "clipboard":
+				// Handle clipboard events
+				eventData, err := json.Marshal(msg.Data)
+				if err != nil {
+					log.Printf("Failed to marshal clipboard data: %v", err)
+					continue
+				}
+
+				var clipboardEvent ClipboardEvent
+				if err := json.Unmarshal(eventData, &clipboardEvent); err != nil {
+					log.Printf("Failed to unmarshal clipboard event: %v", err)
+					continue
+				}
+
+				if err := handleClipboardEvent(clipboardEvent); err != nil {
+					log.Printf("Failed to handle clipboard event: %v", err)
+				}
+
 			default:
 				log.Printf("Unknown message type: %s", msg.Type)
 			}
@@ -316,17 +502,89 @@ func main() {
 		log.Println("WebSocket connection closed")
 	})
 
-	// Serve HTML page
+	// Serve HTML page with interaction support
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// You'll need to update your HTML client to handle the new message format
 		w.Write([]byte(`
 <!DOCTYPE html>
 <html>
 <head>
-    <title>WebRTC Stream</title>
+    <title>Interactive WebRTC Stream</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background: #f0f0f0;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        #videoCanvas {
+            width: 100%;
+            max-width: 800px;
+            border: 2px solid #333;
+            cursor: crosshair;
+            display: block;
+            margin: 0 auto 20px auto;
+            background: #000;
+        }
+        #hiddenVideo {
+            display: none;
+        }
+        .controls {
+            text-align: center;
+            margin: 20px 0;
+        }
+        .control-group {
+            margin: 10px;
+            display: inline-block;
+        }
+        input, textarea, button {
+            padding: 8px;
+            margin: 5px;
+            font-size: 14px;
+        }
+        #clipboardText {
+            width: 300px;
+            height: 60px;
+        }
+        .status {
+            text-align: center;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .status.connected { background: #d4edda; color: #155724; }
+        .status.disconnected { background: #f8d7da; color: #721c24; }
+    </style>
 </head>
 <body>
-    <video id="remoteVideo" autoplay playsinline controls></video>
+    <div class="container">
+        <h1>Interactive WebRTC Stream</h1>
+        <div id="status" class="status disconnected">Disconnected</div>
+
+        <video id="hiddenVideo" autoplay playsinline muted></video>
+        <canvas id="videoCanvas"></canvas>
+
+        <div class="controls">
+            <div class="control-group">
+                <h3>Clipboard</h3>
+                <textarea id="clipboardText" placeholder="Text to paste..."></textarea><br>
+                <button onclick="pasteText()">Paste to Stream</button>
+                <button onclick="copyFromStream()">Copy from Stream</button>
+            </div>
+
+            <div class="control-group">
+                <h3>Keyboard</h3>
+                <input type="text" id="keyInput" placeholder="Type here to send keys..." style="width: 200px;">
+                <button onclick="sendSpecialKey('ctrl+c')">Ctrl+C</button>
+                <button onclick="sendSpecialKey('ctrl+v')">Ctrl+V</button>
+                <button onclick="sendSpecialKey('ctrl+a')">Ctrl+A</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const ws = new WebSocket('ws://localhost:8080/signal');
         const pc = new RTCPeerConnection({
@@ -337,17 +595,38 @@ func main() {
             ]
         });
 
+        const hiddenVideo = document.getElementById('hiddenVideo');
+        const canvas = document.getElementById('videoCanvas');
+        const ctx = canvas.getContext('2d');
+        const status = document.getElementById('status');
+        let animationFrame;
+
         // Add transceiver to receive video
         pc.addTransceiver('video', { direction: 'recvonly' });
 
         pc.ontrack = (event) => {
             console.log('Received track:', event.track);
-            document.getElementById('remoteVideo').srcObject = event.streams[0];
+            hiddenVideo.srcObject = event.streams[0];
+
+            hiddenVideo.addEventListener('loadedmetadata', () => {
+                // Set canvas size to match video
+                canvas.width = hiddenVideo.videoWidth;
+                canvas.height = hiddenVideo.videoHeight;
+
+                // Start rendering video to canvas
+                renderVideoToCanvas();
+            });
         };
+
+        function renderVideoToCanvas() {
+            if (hiddenVideo.videoWidth > 0 && hiddenVideo.videoHeight > 0) {
+                ctx.drawImage(hiddenVideo, 0, 0, canvas.width, canvas.height);
+            }
+            animationFrame = requestAnimationFrame(renderVideoToCanvas);
+        }
 
         pc.onicecandidate = (event) => {
             if (event.candidate) {
-                console.log('Sending ICE candidate:', event.candidate.candidate);
                 ws.send(JSON.stringify({
                     type: 'ice-candidate',
                     data: {
@@ -361,12 +640,214 @@ func main() {
 
         pc.oniceconnectionstatechange = () => {
             console.log('ICE connection state:', pc.iceConnectionState);
+            updateStatus(pc.iceConnectionState);
         };
 
+        function updateStatus(state) {
+            if (state === 'connected' || state === 'completed') {
+                status.textContent = 'Connected';
+                status.className = 'status connected';
+            } else {
+                status.textContent = 'Disconnected (' + state + ')';
+                status.className = 'status disconnected';
+            }
+        }
+
+        // Mouse event handling on canvas
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const x = Math.floor((e.clientX - rect.left) * scaleX);
+            const y = Math.floor((e.clientY - rect.top) * scaleY);
+
+            ws.send(JSON.stringify({
+                type: 'mouse',
+                data: { x, y, action: 'move' }
+            }));
+        });
+
+        canvas.addEventListener('click', (e) => {
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const x = Math.floor((e.clientX - rect.left) * scaleX);
+            const y = Math.floor((e.clientY - rect.top) * scaleY);
+
+            ws.send(JSON.stringify({
+                type: 'mouse',
+                data: { x, y, button: 'left', action: 'click' }
+            }));
+        });
+
+        canvas.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const x = Math.floor((e.clientX - rect.left) * scaleX);
+            const y = Math.floor((e.clientY - rect.top) * scaleY);
+
+            ws.send(JSON.stringify({
+                type: 'mouse',
+                data: { x, y, button: 'right', action: 'click' }
+            }));
+        });
+
+        // Mouse down/up for drag operations
+        canvas.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const x = Math.floor((e.clientX - rect.left) * scaleX);
+            const y = Math.floor((e.clientY - rect.top) * scaleY);
+
+            let button = 'left';
+            if (e.button === 1) button = 'middle';
+            if (e.button === 2) button = 'right';
+
+            ws.send(JSON.stringify({
+                type: 'mouse',
+                data: { x, y, button, action: 'down' }
+            }));
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const x = Math.floor((e.clientX - rect.left) * scaleX);
+            const y = Math.floor((e.clientY - rect.top) * scaleY);
+
+            let button = 'left';
+            if (e.button === 1) button = 'middle';
+            if (e.button === 2) button = 'right';
+
+            ws.send(JSON.stringify({
+                type: 'mouse',
+                data: { x, y, button, action: 'up' }
+            }));
+        });
+
+        // Scroll wheel support
+        canvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const x = Math.floor((e.clientX - rect.left) * scaleX);
+            const y = Math.floor((e.clientY - rect.top) * scaleY);
+
+            // Send scroll as mouse button 4 (scroll up) or 5 (scroll down)
+            const button = e.deltaY < 0 ? '4' : '5';
+            ws.send(JSON.stringify({
+                type: 'mouse',
+                data: { x, y, button, action: 'click' }
+            }));
+        });
+
+        // Make canvas focusable for keyboard events
+        canvas.setAttribute('tabindex', '0');
+        canvas.addEventListener('focus', () => {
+            console.log('Canvas focused - keyboard input enabled');
+        });
+
+        canvas.addEventListener('keydown', (e) => {
+            e.preventDefault();
+
+            let key = e.key;
+            // Handle special key combinations
+            if (e.ctrlKey && e.key !== 'Control') {
+                key = 'ctrl+' + e.key.toLowerCase();
+            } else if (e.altKey && e.key !== 'Alt') {
+                key = 'alt+' + e.key.toLowerCase();
+            } else if (e.shiftKey && e.key !== 'Shift') {
+                // For printable characters, shift is handled naturally
+                // For special keys, we might want to handle them
+                if (e.key.length > 1) {
+                    key = 'shift+' + e.key.toLowerCase();
+                }
+            }
+
+            ws.send(JSON.stringify({
+                type: 'keyboard',
+                data: { key: key, action: 'down' }
+            }));
+        });
+
+        canvas.addEventListener('keyup', (e) => {
+            e.preventDefault();
+
+            let key = e.key;
+            if (e.ctrlKey && e.key !== 'Control') {
+                key = 'ctrl+' + e.key.toLowerCase();
+            } else if (e.altKey && e.key !== 'Alt') {
+                key = 'alt+' + e.key.toLowerCase();
+            } else if (e.shiftKey && e.key !== 'Shift') {
+                if (e.key.length > 1) {
+                    key = 'shift+' + e.key.toLowerCase();
+                }
+            }
+
+            ws.send(JSON.stringify({
+                type: 'keyboard',
+                data: { key: key, action: 'up' }
+            }));
+        });
+
+        // Keyboard event handling
+        document.getElementById('keyInput').addEventListener('input', (e) => {
+            const text = e.target.value;
+            if (text) {
+                ws.send(JSON.stringify({
+                    type: 'keyboard',
+                    data: { key: text, action: 'type' }
+                }));
+                e.target.value = ''; // Clear input
+            }
+        });
+
+        // Global keyboard capture when video is focused
+        canvas.addEventListener('keydown', (e) => {
+            e.preventDefault();
+            ws.send(JSON.stringify({
+                type: 'keyboard',
+                data: { key: e.key, action: 'down' }
+            }));
+        });
+
+        // Clipboard functions
+        function pasteText() {
+            const text = document.getElementById('clipboardText').value;
+            if (text) {
+                ws.send(JSON.stringify({
+                    type: 'clipboard',
+                    data: { text: text, action: 'paste' }
+                }));
+            }
+        }
+
+        function copyFromStream() {
+            ws.send(JSON.stringify({
+                type: 'clipboard',
+                data: { action: 'copy' }
+            }));
+        }
+
+        function sendSpecialKey(key) {
+            ws.send(JSON.stringify({
+                type: 'keyboard',
+                data: { key: key, action: 'down' }
+            }));
+        }
+
+        // WebSocket handling
         ws.onopen = async () => {
             console.log('WebSocket connected');
             const offer = await pc.createOffer();
-            console.log('Created offer:', offer.sdp);
             await pc.setLocalDescription(offer);
             ws.send(JSON.stringify({
                 type: 'offer',
@@ -379,13 +860,10 @@ func main() {
 
         ws.onmessage = async (event) => {
             const msg = JSON.parse(event.data);
-            console.log('Received message:', msg.type);
 
             if (msg.type === 'answer') {
-                console.log('Setting remote description:', msg.data.sdp);
                 await pc.setRemoteDescription(msg.data);
             } else if (msg.type === 'ice-candidate') {
-                console.log('Adding ICE candidate:', msg.data.candidate);
                 await pc.addIceCandidate(msg.data);
             }
         };
@@ -396,6 +874,11 @@ func main() {
 
         ws.onclose = () => {
             console.log('WebSocket closed');
+            updateStatus('disconnected');
+            // Stop animation frame when connection closes
+            if (animationFrame) {
+                cancelAnimationFrame(animationFrame);
+            }
         };
     </script>
 </body>

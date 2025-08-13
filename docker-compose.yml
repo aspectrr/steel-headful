@@ -19,7 +19,7 @@ services:
 
   webrtc-server:
     build:
-      context: pion
+      context: .
       dockerfile: Dockerfile
     container_name: webrtc-server
     depends_on:
